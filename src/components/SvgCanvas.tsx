@@ -17,7 +17,7 @@ interface SvgCanvasProps {
 
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const MAX_SCALE = 40
-const ZOOM_FACTOR = 1.12
+const ZOOM_FACTOR = 1.03
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
 const SELECT_KEY_LABEL = IS_MAC ? '⌘-click' : 'Ctrl-click'
