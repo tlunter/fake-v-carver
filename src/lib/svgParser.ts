@@ -19,13 +19,19 @@
 export type CutType = 'online' | 'exterior' | 'interior' | 'pocket' | 'guide' | 'anchor' | 'unknown'
 
 /**
- * Cut types that are auto-selected on file load and eligible for V-carve
- * ring generation. Pocket and guide are intentionally excluded.
- * 'unknown' is included so paths with unrecognized color encoding are
- * still selectable rather than silently ignored.
- * Pocket, guide, and anchor are intentionally excluded.
+ * Cut types that are eligible for V-carve ring generation. Pocket and guide
+ * are intentionally excluded. 'unknown' is included so paths with unrecognized
+ * color encoding are still selectable rather than silently ignored.
+ * Guide, and anchor are intentionally excluded.
  */
-export const SELECTABLE_CUT_TYPES = new Set<CutType>(['online', 'interior', 'exterior', 'unknown'])
+export const SELECTABLE_CUT_TYPES = new Set<CutType>(['online', 'interior', 'exterior', 'pocket', 'unknown'])
+
+/**
+ * Cut types that are auto-selected on file load for V-carve ring generation.
+ * Pocket, guide, anchor and unknown are purposefully excluded, but pocket
+ * and unknown paths can still be selected manually by the user.
+ */
+export const AUTO_SELECTED_CUT_TYPES = new Set<CutType>(['online', 'interior', 'exterior'])
 
 export interface SvgPathInfo {
   /** Unique ID within the parsed set */
@@ -140,8 +146,8 @@ function detectCutType(el: Element, _isClosed: boolean): CutType {
   if (fillHex && isRed(fillHex)) return 'anchor'
   if (!fillHex && strokeHex && isRed(strokeHex)) return 'anchor'
 
-  // Guide: blue fill (#0068ff or near)
-  if (fillHex && isBlue(fillHex)) return 'guide'
+  // Guide: blue fill or stroke (#0068ff or near)
+  if ((fillHex && isBlue(fillHex)) || (strokeHex && isBlue(strokeHex))) return 'guide'
 
   // Pocket: gray fill
   if (fillHex && isGrey(fillHex)) return 'pocket'

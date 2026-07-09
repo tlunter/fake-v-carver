@@ -46,13 +46,6 @@ export function SvgCanvas({
   const outerRef = useRef<HTMLDivElement>(null)
   const svgWrapRef = useRef<HTMLDivElement>(null)
 
-  // Refs that are always current — used inside Effect 1 so it can read the
-  // latest selectedIds and previewMode without them being in its dependency array.
-  const selectedIdsRef = useRef(selectedIds)
-  selectedIdsRef.current = selectedIds
-  const previewModeRef = useRef(previewMode)
-  previewModeRef.current = previewMode
-
   const svgDims = parseSvgDims(svgText)
 
   const getFitScale = useCallback(() => {
@@ -61,7 +54,8 @@ export function SvgCanvas({
     return Math.min(el.clientWidth / svgDims.w, el.clientHeight / svgDims.h)
   }, [svgDims.w, svgDims.h])
 
-  const [view, setView] = useState<ViewState>({ scale: 1, originX: 0, originY: 0 })
+  // scale: 0 is the sentinel meaning "not yet initialized — compute fit on first inject"
+  const [view, setView] = useState<ViewState>({ scale: 0, originX: 0, originY: 0 })
   const [cmdHeld, setCmdHeld] = useState(false)
 
   const panRef = useRef<{
@@ -70,12 +64,16 @@ export function SvgCanvas({
     startOriginX: number; startOriginY: number
   }>({ active: false, startX: 0, startY: 0, startOriginX: 0, startOriginY: 0 })
 
+  // Always-current ref to view state — lets the injection effect apply the
+  // viewBox synchronously without going through setView (which is async).
+  const viewRef = useRef(view)
+  viewRef.current = view
+
   /** Apply the correct fill/stroke to a selectable path element. */
   function applyPathStyle(
     el: SVGGraphicsElement,
     isSelected: boolean,
-    mode: 'design' | 'shaper',
-    cutType: string
+    mode: 'design' | 'shaper'
   ) {
     el.style.vectorEffect = 'non-scaling-stroke'
     el.style.opacity = '1'
@@ -84,18 +82,6 @@ export function SvgCanvas({
         // Selected paths become guide blue — the Shaper encoding for reference paths
         el.style.fill = SHAPER_GUIDE_FILL
         el.style.stroke = 'none'
-        el.style.strokeWidth = ''
-      } else if (cutType === 'unknown') {
-        // Unknown-encoded paths have no meaningful Shaper color — hide them
-        el.style.fill = 'none'
-        el.style.stroke = 'none'
-        el.style.strokeWidth = ''
-      } else {
-        // Paths with a known Shaper encoding (exterior=black, online=grey stroke,
-        // interior=white+black stroke, pocket=grey) keep their original colors —
-        // they already look correct per the Shaper spec.
-        el.style.fill = ''
-        el.style.stroke = ''
         el.style.strokeWidth = ''
       }
     } else {
@@ -110,17 +96,15 @@ export function SvgCanvas({
       }
     }
   }
-
-  // Fit to viewport when SVG changes
+  // Reset to uninitialized when svgText changes so the injection effect
+  // recomputes the fit scale for the new file.
   useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      setView({ scale: getFitScale(), originX: 0, originY: 0 })
-    })
-    return () => cancelAnimationFrame(id)
-  }, [svgText, getFitScale])
+    setView({ scale: 0, originX: 0, originY: 0 })
+  }, [svgText])
 
-  // Apply viewBox on every view change
+  // Apply viewBox on every view change (pan/zoom interactions)
   useEffect(() => {
+    if (view.scale === 0) return // not yet initialized — injection effect handles first paint
     const svgEl = svgWrapRef.current?.querySelector('svg')
     if (!svgEl || !svgDims.w || !svgDims.h) return
     const outer = outerRef.current
@@ -159,6 +143,7 @@ export function SvgCanvas({
       const cx = e.clientX - rect.left
       const cy = e.clientY - rect.top
       setView(prev => {
+        if (prev.scale === 0) return prev // not yet initialized
         const minScale = Math.min(el.clientWidth / svgDims.w, el.clientHeight / svgDims.h)
         const delta = e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR
         const newScale = Math.min(MAX_SCALE, Math.max(minScale, prev.scale * delta))
@@ -199,33 +184,59 @@ export function SvgCanvas({
   }, [getFitScale])
 
   // -----------------------------------------------------------------------
-  // Effect 1: SVG injection — runs only when svgText, paths, rings change.
-  // Does NOT depend on selectedIds — selection styling is handled separately.
+  // SVG injection + path interaction + ring overlay + selection styling.
+  // Runs whenever svgText, paths, selectedIds, rings, onTogglePath, or
+  // previewMode changes. selectedIds changing always coincides with rings
+  // changing (recompute is triggered on selection), so in practice the
+  // SVG is not re-injected more often than necessary.
   // -----------------------------------------------------------------------
   useEffect(() => {
     const container = svgWrapRef.current
-    if (!container) return
+    const outer = outerRef.current
+    if (!container || !outer) return
 
-    container.innerHTML = svgText
-
-    const svgEl = container.querySelector('svg')
+    // Parse the SVG into a DOM node, apply all attribute adjustments,
+    // then assign to innerHTML in a single write — the browser never
+    // sees the SVG at the wrong size or without the correct viewBox.
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(svgText, 'image/svg+xml')
+    const svgEl = doc.querySelector('svg')
     if (!svgEl) return
 
-    const outer = outerRef.current
-    if (outer) {
-      svgEl.setAttribute('width', String(outer.clientWidth))
-      svgEl.setAttribute('height', String(outer.clientHeight))
+    // Resolve the view to use for this injection.
+    // If scale === 0 (sentinel: not yet initialized, or new file loaded),
+    // compute the fit scale synchronously now — no rAF needed.
+    const vpW = outer.clientWidth
+    const vpH = outer.clientHeight
+    let v = viewRef.current
+    if (v.scale === 0) {
+      const fitScale = getFitScale()
+      v = { scale: fitScale, originX: 0, originY: 0 }
+      // Update both the ref and state so zoom/pan effects see the right value.
+      // setView schedules a re-render but viewRef is already correct for this paint.
+      viewRef.current = v
+      setView(v)
     }
+
+    const vbW = vpW / v.scale
+    const vbH = vpH / v.scale
+    svgEl.setAttribute('viewBox', `${v.originX} ${v.originY} ${vbW} ${vbH}`)
+    svgEl.setAttribute('width', String(vpW))
+    svgEl.setAttribute('height', String(vpH))
     svgEl.style.display = 'block'
-    svgEl.style.width = ''
-    svgEl.style.height = ''
-    // Background color follows preview mode
-    svgEl.style.background = previewModeRef.current === 'shaper' ? '#ffffff' : ''
+    svgEl.style.background = previewMode === 'shaper' ? '#ffffff' : ''
+
+    // Single atomic write — browser paints exactly this
+    container.innerHTML = new XMLSerializer().serializeToString(svgEl)
+
+    // Re-query the live element from the container for all subsequent DOM work
+    const liveSvgEl = container.querySelector('svg')
+    if (!liveSvgEl) return
 
     const byIdx = new Map<number, SvgPathInfo>()
     for (const p of paths) byIdx.set(p.vcarveIdx, p)
 
-    svgEl.querySelectorAll('[data-vcarve-idx]').forEach(node => {
+    liveSvgEl.querySelectorAll('[data-vcarve-idx]').forEach(node => {
       const el = node as SVGGraphicsElement
       const idx = parseInt(el.getAttribute('data-vcarve-idx') ?? '-1', 10)
       const pathInfo = byIdx.get(idx)
@@ -234,12 +245,10 @@ export function SvgCanvas({
       const isSelectable = pathInfo.isClosed && SELECTABLE_CUT_TYPES.has(pathInfo.cutType)
 
       if (isSelectable) {
-        const isSelected = selectedIdsRef.current.has(pathInfo.id)
-        const mode = previewModeRef.current
-        applyPathStyle(el, isSelected, mode, pathInfo.cutType)
+        const isSelected = selectedIds.has(pathInfo.id)
+        applyPathStyle(el, isSelected, previewMode)
         el.setAttribute('data-selectable', 'true')
         el.setAttribute('data-vcarve-id', pathInfo.id)
-        el.setAttribute('data-vcarve-cuttype', pathInfo.cutType)
         el.setAttribute('pointer-events', 'all')
 
         // Fat hit target
@@ -250,7 +259,6 @@ export function SvgCanvas({
         hitEl.setAttribute('pointer-events', 'all')
         hitEl.setAttribute('data-selectable', 'true')
         hitEl.setAttribute('data-vcarve-id', pathInfo.id)
-        hitEl.setAttribute('data-vcarve-cuttype', pathInfo.cutType)
         hitEl.removeAttribute('data-vcarve-idx')
         hitEl.style.vectorEffect = 'non-scaling-stroke'
 
@@ -267,7 +275,7 @@ export function SvgCanvas({
         // Non-selectable paths (guide, anchor, pocket, open paths).
         // Their original colors are already correct per Shaper encoding —
         // don't touch fill/stroke. In design mode, dim with opacity only.
-        if (previewModeRef.current !== 'shaper') {
+        if (previewMode !== 'shaper') {
           el.style.opacity = '0.25'
         }
         el.setAttribute('pointer-events', 'none')
@@ -275,7 +283,7 @@ export function SvgCanvas({
     })
 
     // Ring overlay
-    svgEl.querySelector('#vcarve-rings')?.remove()
+    liveSvgEl.querySelector('#vcarve-rings')?.remove()
     if (rings.length > 0) {
       const totalPasses = Math.max(...rings.map(r => r.passInfo.passNumber))
       const g = document.createElementNS(SVG_NS, 'g')
@@ -285,12 +293,10 @@ export function SvgCanvas({
         const pathEl = document.createElementNS(SVG_NS, 'path')
         pathEl.setAttribute('d', ring.d)
         pathEl.setAttribute('fill', 'none')
-        if (previewModeRef.current === 'shaper') {
-          // Online encoding: gray stroke, no color gradient
+        if (previewMode === 'shaper') {
           pathEl.setAttribute('stroke', SHAPER_ONLINE_STROKE)
           pathEl.setAttribute('opacity', '1')
         } else {
-          // Design mode: pass color gradient
           pathEl.setAttribute('stroke', passColor(ring.passInfo.passNumber, totalPasses))
           pathEl.setAttribute('opacity', '0.9')
         }
@@ -298,46 +304,9 @@ export function SvgCanvas({
         pathEl.setAttribute('vector-effect', 'non-scaling-stroke')
         g.appendChild(pathEl)
       }
-      svgEl.appendChild(g)
+      liveSvgEl.appendChild(g)
     }
-
-    // Re-apply the current viewBox immediately after DOM rebuild
-    // (avoids the one-frame gap that caused the flash)
-    if (outer) {
-      const vpW = outer.clientWidth
-      const vpH = outer.clientHeight
-      setView(prev => {
-        const vbW = vpW / prev.scale
-        const vbH = vpH / prev.scale
-        svgEl.setAttribute('viewBox', `${prev.originX} ${prev.originY} ${vbW} ${vbH}`)
-        svgEl.setAttribute('width', String(vpW))
-        svgEl.setAttribute('height', String(vpH))
-        return prev // no state change — just apply attrs synchronously
-      })
-    }
-  }, [svgText, paths, rings, onTogglePath, previewMode]) // ← selectedIds intentionally excluded
-
-  // -----------------------------------------------------------------------
-  // Effect 2: Selection styling — runs when selectedIds or previewMode changes.
-  // Updates styles on existing elements; never touches the DOM structure.
-  // -----------------------------------------------------------------------
-  useEffect(() => {
-    const svgEl = svgWrapRef.current?.querySelector('svg')
-    if (!svgEl) return
-
-    svgEl.style.background = previewMode === 'shaper' ? '#ffffff' : ''
-
-    svgEl.querySelectorAll('[data-vcarve-id]').forEach(node => {
-      const el = node as SVGGraphicsElement
-      const id = el.getAttribute('data-vcarve-id') ?? ''
-      const cutType = el.getAttribute('data-vcarve-cuttype') ?? 'unknown'
-
-      // Skip hit targets (transparent overlay clones)
-      if (!el.getAttribute('data-vcarve-idx') && el.getAttribute('fill') === 'transparent') return
-
-      applyPathStyle(el, selectedIds.has(id), previewMode, cutType)
-    })
-  }, [selectedIds, previewMode])
+  }, [svgText, paths, selectedIds, rings, onTogglePath, previewMode, getFitScale])
 
   return (
     <div

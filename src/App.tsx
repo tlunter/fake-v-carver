@@ -3,7 +3,7 @@ import { DropZone } from './components/DropZone'
 import { SvgCanvas } from './components/SvgCanvas'
 import { SettingsPanel, DEFAULT_MAX_BIT_DIAMETER_IN } from './components/SettingsPanel'
 import { InfoPanel } from './components/InfoPanel'
-import { parseSvg, flattenPath, buildTransformFromAttributes, SELECTABLE_CUT_TYPES } from './lib/svgParser'
+import { parseSvg, flattenPath, buildTransformFromAttributes, AUTO_SELECTED_CUT_TYPES } from './lib/svgParser'
 import type { SvgPathInfo } from './lib/svgParser'
 import { findMaxInscribedRadius, offsetContoursToCurves } from './lib/offsetEngine'
 import { computePassTable, degToRad, computePxPerMm, DEFAULT_DPI } from './lib/vcarve'
@@ -66,6 +66,15 @@ export default function App() {
   // Store the parsed SVG document for transform lookups during ring computation
   const parsedDocRef = useRef<Document | null>(null)
 
+  // Per-path geometry cache: keyed by vcarveIdx.
+  // Stores the expensive flattenPath + findMaxInscribedRadius results so
+  // re-selecting a previously computed path skips those steps entirely.
+  // Cleared when a new file is loaded.
+  const pathGeoCacheRef = useRef<Map<number, {
+    contours: { x: number; y: number }[][]
+    inscribedRadius: number
+  }>>(new Map())
+
   /** Recompute pxPerUnit from the current stamped SVG text, dpi, and unit */
   const recalcPxPerUnit = useCallback((svgTxt: string, currentDpi: number, currentUnit: Unit) => {
     const pxMm = computePxPerMm(svgTxt, currentDpi)
@@ -78,6 +87,7 @@ export default function App() {
     setRings([])
     setPassTable([])
     setMaxR(null)
+    pathGeoCacheRef.current.clear()
 
     const { stampedSvgText, paths: extractedPaths } = parseSvg(text)
     setSvgText(stampedSvgText)
@@ -88,7 +98,7 @@ export default function App() {
     // exterior, or unknown). Pocket and guide are excluded.
     const autoSelected = new Set(
       extractedPaths
-        .filter(p => p.isClosed && SELECTABLE_CUT_TYPES.has(p.cutType))
+        .filter(p => p.isClosed && AUTO_SELECTED_CUT_TYPES.has(p.cutType))
         .map(p => p.id)
     )
     setSelectedIds(autoSelected)
@@ -150,21 +160,29 @@ export default function App() {
     // Run the heavy computation asynchronously, yielding between each path
     // so the browser can handle interactions and render updates.
     ;(async () => {
-      // --- Phase 1: flatten paths (yields after each) ---
-      const pathData: { id: string; contours: { x: number; y: number }[][] }[] = []
+    // --- Phase 1: flatten paths (cache hit skips DOM work) ---
+    const pathData: { id: string; contours: { x: number; y: number }[][] }[] = []
 
-      for (const pathInfo of selectedPaths) {
-        if (gen !== computeGenRef.current) return // cancelled
+    for (const pathInfo of selectedPaths) {
+      if (gen !== computeGenRef.current) return
 
-        const el = svgRoot.querySelector(`[data-vcarve-idx="${pathInfo.vcarveIdx}"]`)
-        if (!el) continue
-        const transform = buildTransformFromAttributes(el, svgRoot)
-        const contours = flattenPath(pathInfo.dString, transform)
-        if (contours.length > 0 && contours.some(c => c.length >= 3)) {
-          pathData.push({ id: pathInfo.id, contours })
-        }
-        await yieldFrame()
+      const cached = pathGeoCacheRef.current.get(pathInfo.vcarveIdx)
+      if (cached) {
+        pathData.push({ id: pathInfo.id, contours: cached.contours })
+        continue
       }
+
+      const el = svgRoot.querySelector(`[data-vcarve-idx="${pathInfo.vcarveIdx}"]`)
+      if (!el) continue
+      const transform = buildTransformFromAttributes(el, svgRoot)
+      const contours = flattenPath(pathInfo.dString, transform)
+      if (contours.length > 0 && contours.some(c => c.length >= 3)) {
+        // Store partial cache entry — inscribedRadius filled in Phase 2
+        pathGeoCacheRef.current.set(pathInfo.vcarveIdx, { contours, inscribedRadius: -1 })
+        pathData.push({ id: pathInfo.id, contours })
+      }
+      await yieldFrame()
+    }
 
       if (gen !== computeGenRef.current) return
       if (pathData.length === 0) {
@@ -175,19 +193,27 @@ export default function App() {
         return
       }
 
-      // --- Phase 2: find inscribed radii per path ---
-      // bitRadiusPx caps the lateral step per pass (not the total R).
-      // Each path uses its own full geometric R so the number of passes
-      // it can fit is determined by its own width, but no single step
-      // exceeds one bit radius worth of material.
-      const bitRadiusPx = (maxBitDiameter / 2) * dpi
+    // --- Phase 2: find inscribed radii per path (cache hit skips Clipper binary search) ---
+    const bitRadiusPx = (maxBitDiameter / 2) * dpi
 
-      const pathRadii: number[] = []
-      for (const { contours } of pathData) {
-        if (gen !== computeGenRef.current) return
-        pathRadii.push(findMaxInscribedRadius(contours))
+    const pathRadii: number[] = []
+    for (const { id, contours } of pathData) {
+      if (gen !== computeGenRef.current) return
+
+      // Find the vcarveIdx for this path to check the cache
+      const pathInfo = selectedPaths.find(p => p.id === id)!
+      const cached = pathGeoCacheRef.current.get(pathInfo.vcarveIdx)
+
+      let radius: number
+      if (cached && cached.inscribedRadius >= 0) {
+        radius = cached.inscribedRadius
+      } else {
+        radius = findMaxInscribedRadius(contours)
+        if (cached) cached.inscribedRadius = radius
         await yieldFrame()
       }
+      pathRadii.push(radius)
+    }
 
       if (gen !== computeGenRef.current) return
 
@@ -300,6 +326,7 @@ export default function App() {
               setMaxR(null)
               parsedDocRef.current = null
               stampedSvgTextRef.current = null
+              pathGeoCacheRef.current.clear()
             }}
             className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors"
           >
