@@ -133,6 +133,30 @@ export function SvgCanvas({
     }
   }, [])
 
+  /**
+   * Clamp the view origin so the viewport never shows negative SVG coordinates
+   * or extends beyond the SVG's width/height. At scales where the SVG is
+   * smaller than the viewport (i.e. at fit scale), this centers the SVG.
+   */
+  function clampOrigin(originX: number, originY: number, scale: number): { originX: number; originY: number } {
+    const outer = outerRef.current
+    if (!outer || !svgDims.w || !svgDims.h) return { originX, originY }
+    const vpW = outer.clientWidth
+    const vpH = outer.clientHeight
+    // How many SVG units fit in the viewport at this scale
+    const visW = vpW / scale
+    const visH = vpH / scale
+    // If the viewport is wider than the SVG, center horizontally
+    const maxOriginX = svgDims.w > visW ? svgDims.w - visW : 0
+    const maxOriginY = svgDims.h > visH ? svgDims.h - visH : 0
+    const minOriginX = svgDims.w > visW ? 0 : (svgDims.w - visW) / 2
+    const minOriginY = svgDims.h > visH ? 0 : (svgDims.h - visH) / 2
+    return {
+      originX: Math.min(maxOriginX, Math.max(minOriginX, originX)),
+      originY: Math.min(maxOriginY, Math.max(minOriginY, originY)),
+    }
+  }
+
   // Wheel zoom
   useEffect(() => {
     const el = outerRef.current
@@ -149,7 +173,10 @@ export function SvgCanvas({
         const newScale = Math.min(MAX_SCALE, Math.max(minScale, prev.scale * delta))
         const svgX = prev.originX + cx / prev.scale
         const svgY = prev.originY + cy / prev.scale
-        return { scale: newScale, originX: svgX - cx / newScale, originY: svgY - cy / newScale }
+        const rawOriginX = svgX - cx / newScale
+        const rawOriginY = svgY - cy / newScale
+        const { originX, originY } = clampOrigin(rawOriginX, rawOriginY, newScale)
+        return { scale: newScale, originX, originY }
       })
     }
     el.addEventListener('wheel', onWheel, { passive: false })
@@ -169,7 +196,12 @@ export function SvgCanvas({
       if (!panRef.current.active) return
       const dx = e.clientX - panRef.current.startX
       const dy = e.clientY - panRef.current.startY
-      setView(prev => ({ ...prev, originX: panRef.current.startOriginX - dx / prev.scale, originY: panRef.current.startOriginY - dy / prev.scale }))
+      setView(prev => {
+        const rawX = panRef.current.startOriginX - dx / prev.scale
+        const rawY = panRef.current.startOriginY - dy / prev.scale
+        const { originX, originY } = clampOrigin(rawX, rawY, prev.scale)
+        return { ...prev, originX, originY }
+      })
     }
     const onUp = () => { panRef.current.active = false; el.style.cursor = '' }
     el.addEventListener('mousedown', onDown)
